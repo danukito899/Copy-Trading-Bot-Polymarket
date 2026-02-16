@@ -32,6 +32,57 @@ position_update_task: Optional[asyncio.Task] = None
 is_first_run = True
 
 
+WATCHED_ADDRESSES = {addr.lower() for addr in USER_ADDRESSES}
+
+
+def extract_activity_payloads(message_data: Any) -> List[Dict[str, Any]]:
+    """Extract activity payload dicts from varying RTDS message shapes."""
+    payloads: List[Dict[str, Any]] = []
+
+    def add_payload(candidate: Any):
+        if isinstance(candidate, dict):
+            payloads.append(candidate)
+
+    if isinstance(message_data, dict):
+        if message_data.get('topic') == 'activity' and message_data.get('type') == 'trades':
+            payload = message_data.get('payload')
+            if isinstance(payload, list):
+                for item in payload:
+                    add_payload(item)
+            else:
+                add_payload(payload)
+        elif isinstance(message_data.get('payload'), dict):
+            add_payload(message_data.get('payload'))
+    elif isinstance(message_data, list):
+        for entry in message_data:
+            payloads.extend(extract_activity_payloads(entry))
+
+    return payloads
+
+
+def extract_trader_address(activity: Dict[str, Any]) -> Optional[str]:
+    """Extract trader wallet address from RTDS activity payload."""
+    for key in ('proxyWallet', 'walletAddress', 'user', 'maker', 'trader', 'address'):
+        value = activity.get(key)
+        if isinstance(value, str) and value.startswith('0x'):
+            return value.lower()
+    return None
+
+
+def extract_activity_timestamp_ms(activity: Dict[str, Any]) -> int:
+    """Extract timestamp in ms from activity, tolerating schema differences."""
+    value = activity.get('timestamp')
+    if value is None:
+        value = activity.get('createdAt') or activity.get('time') or activity.get('ts')
+
+    try:
+        ts = int(value)
+    except Exception:
+        return int(__import__('time').time() * 1000)
+
+    return ts if ts > 1000000000000 else ts * 1000
+
+
 async def init():
     """Initialize monitor"""
     counts = []
@@ -131,12 +182,8 @@ async def process_trade_activity(activity: Dict[str, Any], address: str):
             activity_asset = str(activity_asset)
 
         # Skip if too old
-        activity_timestamp = activity.get('timestamp', 0)
-        if activity_timestamp > 1000000000000:
-            activity_timestamp_ms = activity_timestamp
-        else:
-            activity_timestamp_ms = activity_timestamp * 1000
-        
+        activity_timestamp_ms = extract_activity_timestamp_ms(activity)
+
         import time
         hours_ago = (time.time() * 1000 - activity_timestamp_ms) / (1000 * 60 * 60)
         if hours_ago > TOO_OLD_TIMESTAMP:
@@ -149,8 +196,8 @@ async def process_trade_activity(activity: Dict[str, Any], address: str):
         
         # Save new trade to database
         new_activity = {
-            'proxyWallet': activity.get('proxyWallet'),
-            'timestamp': activity.get('timestamp'),
+            'proxyWallet': extract_trader_address(activity) or activity.get('proxyWallet'),
+            'timestamp': int(activity_timestamp_ms / 1000),
             'conditionId': activity.get('conditionId'),
             'type': 'TRADE',
             'size': activity.get('size'),
@@ -241,11 +288,13 @@ async def connect_rtds():
         success('RTDS WebSocket connected')
         reconnect_attempts = 0
         
-        # Subscribe to activity/trades for each trader address
+        # Subscribe to activity/trades; include watched wallets when supported by server schema.
         subscriptions = [{
             'topic': 'activity',
             'type': 'trades',
-        } for _ in USER_ADDRESSES]
+            'users': USER_ADDRESSES,
+            'wallets': USER_ADDRESSES,
+        }]
         
         subscribe_message = {
             'action': 'subscribe',
@@ -280,7 +329,7 @@ async def connect_rtds():
                     continue
 
                 # Handle subscription confirmation
-                if data.get('action') == 'subscribed' or data.get('status') == 'subscribed':
+                if isinstance(data, dict) and (data.get('action') == 'subscribed' or data.get('status') == 'subscribed'):
                     info('RTDS subscription confirmed')
                     continue
                 
@@ -291,6 +340,8 @@ async def connect_rtds():
                     
                     if trader_address in [addr.lower() for addr in USER_ADDRESSES]:
                         await process_trade_activity(activity, trader_address)
+                    elif trader_address is None and len(USER_ADDRESSES) == 1:
+                        await process_trade_activity(activity, USER_ADDRESSES[0].lower())
             except Exception as e:
                 error(f'Error processing RTDS message: {e}')
                 
