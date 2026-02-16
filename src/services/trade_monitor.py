@@ -29,6 +29,7 @@ MAX_RECONNECT_ATTEMPTS = 10
 RECONNECT_DELAY = 5  # 5 seconds
 is_running = True
 position_update_task: Optional[asyncio.Task] = None
+activity_poll_task: Optional[asyncio.Task] = None
 is_first_run = True
 
 
@@ -273,6 +274,31 @@ async def update_positions():
             error(f'Error updating positions for {address[:6]}...{address[-4:]}: {e}')
 
 
+async def poll_recent_trades_once() -> None:
+    """HTTP fallback: fetch recent trades per watched wallet and process unseen ones."""
+    for address in USER_ADDRESSES:
+        try:
+            activity_url = f'https://data-api.polymarket.com/activity?user={address}&type=TRADE&limit=50'
+            activities = await fetch_data_async(activity_url)
+            if not isinstance(activities, list):
+                continue
+
+            for activity in activities:
+                if isinstance(activity, dict):
+                    await process_trade_activity(activity, address.lower())
+        except Exception as e:
+            warning(f'HTTP activity fallback failed for {address[:6]}...{address[-4:]}: {e}')
+
+
+async def poll_recent_trades_periodically() -> None:
+    """Periodic HTTP fallback to ensure new trades are ingested if RTDS is silent."""
+    while is_running:
+        await asyncio.sleep(10)
+        if is_running:
+            await poll_recent_trades_once()
+
+
+
 async def connect_rtds():
     """Connect to RTDS WebSocket and subscribe to trader activities"""
     global ws, reconnect_attempts
@@ -373,13 +399,17 @@ async def reconnect_loop():
 
 def stop_trade_monitor():
     """Stop the trade monitor gracefully"""
-    global is_running, position_update_task, ws
+    global is_running, position_update_task, activity_poll_task, ws
     
     is_running = False
     
     if position_update_task:
         position_update_task.cancel()
         position_update_task = None
+
+    if activity_poll_task:
+        activity_poll_task.cancel()
+        activity_poll_task = None
     
     if ws:
         asyncio.create_task(ws.close())
@@ -390,7 +420,7 @@ def stop_trade_monitor():
 
 async def trade_monitor():
     """Main trade monitor function"""
-    global is_first_run, position_update_task
+    global is_first_run, position_update_task, activity_poll_task
     
     await init()
     success(f'Monitoring {len(USER_ADDRESSES)} trader(s) using RTDS (Real-Time Data Stream)')
@@ -413,7 +443,14 @@ async def trade_monitor():
     # Connect to RTDS
     try:
         await reconnect_loop()
-        
+
+        # Kick off HTTP fallback polling in parallel with RTDS listener.
+        activity_poll_task = asyncio.create_task(poll_recent_trades_periodically())
+        info('HTTP activity fallback enabled (10s interval)')
+
+        # Prime with one immediate poll so fresh trades are not missed at startup.
+        await poll_recent_trades_once()
+
         # Update positions periodically (every 30 seconds)
         async def update_positions_periodically():
             while is_running:
