@@ -3,6 +3,7 @@ Create Polymarket CLOB client
 """
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))); import src.lib_core
 import inspect
+from dataclasses import asdict, is_dataclass
 from typing import Optional, Dict, Any, Callable
 from web3 import Web3
 from eth_account import Account
@@ -35,6 +36,57 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+def _as_plain_dict(value: Any) -> Dict[str, Any]:
+    """Best-effort conversion of SDK response objects to plain dictionaries."""
+    if isinstance(value, dict):
+        return value
+
+    if is_dataclass(value):
+        return asdict(value)
+
+    if hasattr(value, 'dict') and callable(getattr(value, 'dict')):
+        try:
+            payload = value.dict()
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+    if hasattr(value, '__dict__'):
+        payload = {
+            key: raw
+            for key, raw in vars(value).items()
+            if not key.startswith('_')
+        }
+        if payload:
+            return payload
+
+    raise TypeError(f'Cannot convert {type(value)} to dictionary')
+
+
+def _as_price_level(level: Any) -> Dict[str, Any]:
+    """Normalize a single order-book level to a dict with price/size keys."""
+    if isinstance(level, dict):
+        return level
+
+    normalized = _as_plain_dict(level)
+    if 'price' in normalized and 'size' in normalized:
+        return normalized
+
+    # Some SDK versions may use alternate key names.
+    price = normalized.get('p') if 'p' in normalized else normalized.get('price')
+    size = normalized.get('s') if 's' in normalized else normalized.get('size')
+    return {'price': price, 'size': size}
+
+
+def _normalize_order_book(order_book: Any) -> Dict[str, Any]:
+    """Normalize SDK order-book objects into the dict shape used by the bot."""
+    payload = _as_plain_dict(order_book)
+    payload['bids'] = [_as_price_level(level) for level in (payload.get('bids') or [])]
+    payload['asks'] = [_as_price_level(level) for level in (payload.get('asks') or [])]
+    return payload
 
 
 async def is_gnosis_safe(address: str) -> bool:
@@ -159,13 +211,12 @@ class ClobClient:
         if self._sdk_client and hasattr(self._sdk_client, 'get_order_book'):
             try:
                 order_book = await _call_maybe_async(self._sdk_client.get_order_book, token_id)
-                if isinstance(order_book, dict):
-                    trace(
-                        f'get_order_book() SDK response: bids={len(order_book.get("bids", []) or [])}, '
-                        f'asks={len(order_book.get("asks", []) or [])}'
-                    )
-                    return order_book
-                return dict(order_book)
+                normalized = _normalize_order_book(order_book)
+                trace(
+                    f'get_order_book() SDK response: bids={len(normalized.get("bids", []) or [])}, '
+                    f'asks={len(normalized.get("asks", []) or [])}'
+                )
+                return normalized
             except Exception as e:
                 error(f'SDK get_order_book failed for token {token_id}: {e}')
 
@@ -198,23 +249,42 @@ class ClobClient:
                 'Install it and configure credentials.'
             )
 
-        # Try SDK create_market_order path first.
+        # Prefer create_order with explicit price/size since this bot already fetches top-of-book
+        # and sets a limit price for FOK execution.
+        if hasattr(self._sdk_client, 'create_order'):
+            try:
+                from py_clob_client.clob_types import OrderArgs  # type: ignore
+
+                size = amount / price if price > 0 else 0.0
+                typed_args = OrderArgs(price=price, size=size, side=side, token_id=token_id)
+                signed = await _call_maybe_async(self._sdk_client.create_order, typed_args)
+                trace('create_market_order() signed order generated via SDK method create_order')
+                return _as_plain_dict(signed)
+            except Exception as e:
+                error(f'create_order path failed, trying create_market_order fallback: {e}')
+
+        # Fallback to SDK create_market_order for variants that do not expose create_order.
         if hasattr(self._sdk_client, 'create_market_order'):
-            signed = await _call_maybe_async(self._sdk_client.create_market_order, order_args)
+            market_order_args: Any = order_args
+            try:
+                from py_clob_client.clob_types import MarketOrderArgs  # type: ignore
+
+                # SDK market order amount is denominated in quote units for BUY and base units for SELL.
+                market_amount = amount if side == 'BUY' else (amount / price if price > 0 else amount)
+                market_order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=market_amount,
+                    side=side,
+                )
+            except Exception:
+                # Fallback to dict for SDK variants that still support it.
+                market_order_args = order_args
+
+            signed = await _call_maybe_async(self._sdk_client.create_market_order, market_order_args)
             trace('create_market_order() signed order generated via SDK method create_market_order')
-            return signed if isinstance(signed, dict) else dict(signed)
+            return _as_plain_dict(signed)
 
-        # Fallback to create_order using typed order args from py_clob_client.
-        try:
-            from py_clob_client.clob_types import OrderArgs  # type: ignore
-
-            size = amount / price if price > 0 else 0.0
-            typed_args = OrderArgs(price=price, size=size, side=side, token_id=token_id)
-            signed = await _call_maybe_async(self._sdk_client.create_order, typed_args)
-            trace('create_market_order() signed order generated via SDK method create_order')
-            return signed if isinstance(signed, dict) else dict(signed)
-        except Exception as e:
-            raise RuntimeError(f'Failed to create market order with SDK: {e}')
+        raise RuntimeError('SDK client has neither create_order nor create_market_order methods')
     
     async def post_order(self, signed_order: Dict[str, Any], order_type: str) -> Dict[str, Any]:
         """Submit signed order through SDK."""
@@ -235,7 +305,7 @@ class ClobClient:
             pass
 
         response = await _call_maybe_async(self._sdk_client.post_order, signed_order, final_order_type)
-        response_dict = response if isinstance(response, dict) else dict(response)
+        response_dict = _as_plain_dict(response)
         trace(f'post_order() response keys: {list(response_dict.keys())}')
         return response_dict
 
